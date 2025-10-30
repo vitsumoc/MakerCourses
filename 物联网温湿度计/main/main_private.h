@@ -1,1 +1,0 @@
-const char BAFA_KEY[]  = "30aa96063666414fa36879cd4535e615";
