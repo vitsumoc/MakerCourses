@@ -3,6 +3,8 @@
 #include <U8g2lib.h>
 #include <ArduinoMqttClient.h>
 
+#include "main_private.h"
+
 DHT dht4(4, 11);
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0,  0, 2, U8X8_PIN_NONE);
 WiFiClient wifiClient;
@@ -42,7 +44,7 @@ void setup(){
   Serial.begin(9600);
 
   // MQTT客户端初始化
-  mqttClient.setId("30aa96063666414fa36879cd4535e615");
+  mqttClient.setId(BAFA_KEY);
 }
 
 void loop(){
