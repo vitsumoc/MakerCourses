@@ -13,9 +13,9 @@ WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
 
 // MQTT 配置
-const char broker[] = "bemfa.com";        // borker地址
-int        port     = 9501;               // 服务端口
-const char topic[]  = "wenshidu01II004";  // 主题
+const char broker[] = "8.154.32.180";        // borker地址
+int        port     = 1883;               // 服务端口
+const char topic[]  = "/wenshidu/1.0/vc";  // 主题
 
 // 定义业务变量
 volatile float temperature; // 温度
@@ -46,10 +46,12 @@ void setup(){
 
   // 温湿度传感器初始化
   dht4.begin();
-  Serial.begin(9600);
 
   // MQTT客户端初始化
-  mqttClient.setId(BAFA_KEY);
+  // mqttClient.setId(BAFA_KEY);
+
+  // 串口初始化
+  Serial.begin(9600);
 }
 
 void loop(){
@@ -69,9 +71,8 @@ void loop(){
   if (WiFi.status() == WL_CONNECTED) {
     if (mqttClient.connect(broker, port)) {
       mqttClient.beginMessage(topic);
-      mqttClient.printf("#%.1f#%.1f#", temperature, humidity);
+      mqttClient.printf("{\"temperature\":%.1f,\"humidity\":%.1f}", temperature, humidity);
       mqttClient.endMessage();
-      mqttClient.disconnect();    // 发消息后断链，当短链接
     }
   }
 
