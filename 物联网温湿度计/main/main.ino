@@ -5,19 +5,24 @@
 
 #include "main_private.h"
 
+// DHT11 接 4脚
 DHT dht4(4, 11);
+// SCL 接 0 脚，SDA 接 2 脚
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0,  0, 2, U8X8_PIN_NONE);
 WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
 
-const char broker[] = "bemfa.com";
-int        port     = 9501;
-const char topic[]  = "wenshidu01II004";
+// MQTT 配置
+const char broker[] = "bemfa.com";        // borker地址
+int        port     = 9501;               // 服务端口
+const char topic[]  = "wenshidu01II004";  // 主题
 
-volatile float temperature;
-volatile float humidity;
-volatile int wifi_status;
+// 定义业务变量
+volatile float temperature; // 温度
+volatile float humidity;    // 湿度
+volatile int wifi_status;   // WIFI连接状态
 
+// u8g2显示函数
 void page1() {
   u8g2.setFont(u8g2_font_wqy16_t_gb2312);
   u8g2.setFontPosTop();
@@ -35,7 +40,7 @@ void page1() {
 
 void setup(){
   // 显示器初始化
-  u8g2.setI2CAddress(0x3C * 2);
+  u8g2.setI2CAddress(0x3C * 2); // i2c 地址 0x3c
   u8g2.begin();
   u8g2.enableUTF8Print();
 
@@ -50,7 +55,7 @@ void setup(){
 void loop(){
   // 尝试链接WIFI 并作为采集间隔
   if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin("xingxingcode", "daxingxing");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
   }
   delay(10 * 1000);
   
@@ -66,6 +71,7 @@ void loop(){
       mqttClient.beginMessage(topic);
       mqttClient.printf("#%.1f#%.1f#", temperature, humidity);
       mqttClient.endMessage();
+      mqttClient.disconnect();    // 发消息后断链，当短链接
     }
   }
 
