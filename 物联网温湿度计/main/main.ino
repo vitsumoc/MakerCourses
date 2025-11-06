@@ -13,9 +13,9 @@ WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
 
 // MQTT 配置
-const char broker[] = "8.154.32.180";        // borker地址
+const char broker[] = BROKER;        // borker地址
 int        port     = 1883;               // 服务端口
-const char topic[]  = "/wenshidu/1.0/vc";  // 主题
+const char topic[]  = TOPIC;  // 主题
 
 // 定义业务变量
 volatile float temperature; // 温度
