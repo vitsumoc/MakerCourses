@@ -82,9 +82,6 @@ void setup(){
   // 温湿度传感器初始化
   dht4.begin();
 
-  // MQTT客户端初始化
-  // mqttClient.setId(BAFA_KEY);
-
   // 串口初始化
   Serial.begin(9600);
   
