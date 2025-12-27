@@ -40,11 +40,11 @@ void page1() {
   u8g2.printf("湿度：%.1f", humidity);
   u8g2.setCursor(8,46);
   if (wifi_status == WL_CONNECTED && timeSynced) {
-    u8g2.printf("WIFI/校时：ON √");
+    u8g2.printf("网/校时：√ √");
   } else if (wifi_status == WL_CONNECTED && !timeSynced) {
-    u8g2.printf("WIFI/校时：ON ×");
+    u8g2.printf("网/校时：√ ×");
   } else {
-    u8g2.printf("WIFI/校时：OFF ×");
+    u8g2.printf("网/校时：× ×");
   }
 }
 
