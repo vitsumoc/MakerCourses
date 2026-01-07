@@ -1,0 +1,84 @@
+【中文版】
+📦 模块简接总结：
+
+[ESP32-C3 GPIO vs 模块功能对照]
+----------------------------
+【1】TFT屏幕-ST7789V2
+GPIO2   -->【TFT屏幕】ST7789 SCLK  （有的印刷的SCL，有的是SCK）
+GPIO3   -->【TFT屏幕】 ST7789 MOSI （有的印刷的SDA）
+GPIO19  -->【TFT屏幕】 ST7789 CS  
+GPIO12  -->【TFT屏幕】 ST7789 DC  
+GPIO13  -->【TFT屏幕】 ST7789 RST  
+GPIO18  -->【TFT屏幕】 ST7789 BL  
+GND -->【TFT屏幕】ST7789 GND
+3.3V -->【TFT屏幕】ST7789 VCC
+
+【2】心率血氧模块-MAX30102
+GPIO4   -->【心率血氧模块】 MAX30102 SDA
+GPIO5   -->【心率血氧模块】MAX30102 SCL  
+GND -->【心率血氧模块】MAX30102 GND
+ 5V -->【心率血氧模块】MAX30102 VCC（重要！是5V！对了，有的印刷的VIN）
+
+【3】RTC时钟模块-PCF8563
+GND -->【RTC时钟模块】PCF8563 GND
+3.3V -->【RTC时钟模块】PCF8563 VCC
+GPIO4   -->【RTC时钟模块】PCF8563 SDA（对，你没看错！和心率模块是一个位置，需要焊接）
+GPIO5   -->【RTC时钟模块】PCF8563 SCL （对，你没看错！和心率模块是一个位置，需要焊接）
+
+【4】轻触开关
+GPIO9   --> 【校准按钮】任意引脚
+GND -->【校准按钮】同一边并排引脚
+
+⚠️ 注意：确保 MAX30102 的 I2C 地址未改写（默认为 0x57）
+
+==============================================
+
+🧪 建议：烧录前：
+- 确保显示线焊接正确（有些模块 CS、DC 要查文档）
+- 液晶电压兼容ESP32 (必须是3.3V/兼容5V)
+- 均已导通电源，且 GND 共地 ✅
+
+💬 如需测试串口输出，请使用 **115200 波特率**
+
+【ENGLISH】
+📦 Module Connection Summary:
+
+[ESP32-C3 GPIO vs Module Function Comparison]
+----------------------------
+【1】TFT Screen-ST7789V2
+GPIO2   -->【TFT Screen】ST7789 SCLK  (Some printed as SCL, some as SCK)
+GPIO3   -->【TFT Screen】ST7789 MOSI  (Some printed as SDA)
+GPIO19  -->【TFT Screen】ST7789 CS  
+GPIO12  -->【TFT Screen】ST7789 DC  
+GPIO13  -->【TFT Screen】ST7789 RST  
+GPIO18  -->【TFT Screen】ST7789 BL  
+GND -->【TFT Screen】ST7789 GND
+3.3V -->【TFT Screen】ST7789 VCC
+
+【2】Heart Rate & Blood Oxygen Module-MAX30102
+GPIO4   -->【Heart Rate & Blood Oxygen Module】MAX30102 SDA
+GPIO5   -->【Heart Rate & Blood Oxygen Module】MAX30102 SCL  
+GND -->【Heart Rate & Blood Oxygen Module】MAX30102 GND
+5V -->【Heart Rate & Blood Oxygen Module】MAX30102 VCC (Important! It's 5V! By the way, some printed as VIN)
+
+【3】RTC Clock Module-PCF8563
+GND -->【RTC Clock Module】PCF8563 GND
+3.3V -->【RTC Clock Module】PCF8563 VCC
+GPIO4   -->【RTC Clock Module】PCF8563 SDA (Yes, you read that right! Shares the same pin with the heart rate module and needs soldering)
+GPIO5   -->【RTC Clock Module】PCF8563 SCL  (Yes, you read that right! Shares the same pin with the heart rate module and needs soldering)
+
+【4】Tactile Switch
+GPIO9   --> 【Calibration Button】Any pin
+GND -->【Calibration Button】Same-side parallel pins
+
+⚠️ Note: Ensure the MAX30102's I2C address is not modified (default is 0x57)
+
+==============================================
+
+🧪 Suggestions: Before burning:
+- Ensure display wires are soldered correctly (for some modules, CS and DC need to check documentation)
+- LCD voltage is compatible with ESP32 (must be 3.3V/compatible with 5V)
+- All power supplies are connected, and GND is common ✅
+
+💬 For serial port output testing, please use **115200 baud rate**
+

@@ -1,0 +1,1360 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <Wire.h>
+#include <MAX30105.h>
+#include <EEPROM.h>
+#include <RTClib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <time.h>
+
+// ==== 引脚定义 ====
+#define TFT_SCLK   2
+#define TFT_MOSI   3
+#define TFT_CS    19
+#define TFT_DC    12
+#define TFT_RST   13
+#define TFT_BL    18
+
+#define MAX30102_SDA  4
+#define MAX30102_SCL  5
+#define CALIBRATION_BTN 9  // 校准按钮连接的GPIO引脚
+
+#define FINGER_THRESHOLD 5000  // 默认阈值
+#define EEPROM_ADDR_THRESHOLD 0  // EEPROM中存储阈值的地址
+
+// ==== 颜色宏 ====
+#define ST7789_BLACK   ST77XX_BLACK
+#define ST7789_RED     ST77XX_RED
+#define ST7789_GREEN   ST77XX_GREEN
+#define ST7789_WHITE   ST77XX_WHITE
+#define ST7789_CYAN    ST77XX_CYAN // **已确保此行语法正确**
+#define CUSTOM_YELLOW  0xFD60
+#define SOFT_GRAY_COLOR 0x8410  // 柔和灰色 RGB565
+
+// 在全局变量区域添加
+bool clockFirstDraw = true;
+
+// ==== 屏幕控制变量 ====
+#define SCREEN_TIMEOUT 30000  // 屏幕超时时间（毫秒）
+bool screenOn = true;         // 屏幕状态
+unsigned long lastActivityTime = 0;  // 最后活动时间
+
+// ==== 新增：同步状态变量 ====
+bool showSyncSuccess = false;  // 是否显示同步成功
+bool showSyncFail = false;     // 是否显示同步失败
+unsigned long syncStatusExpire = 0;  // 状态到期时间戳
+
+// ==== 新增：时间校准状态变量 ====
+bool timeCalibrating = false;  // 是否处于时间校准中
+unsigned long calibrationStartMillis = 0;  // 校准开始时间戳
+const unsigned long TIME_CALIBRATION_MAX_DURATION = 15000;  // 最大校准时间（15秒）
+
+// ==== WiFi和时间校准变量 ====
+#define CONFIG_BUTTON_TIMEOUT 5000  // 长按5秒进入配置模式
+#define WIFI_EEPROM_ADDR 100        // WiFi凭据在EEPROM中的地址
+#define WIFI_CONFIG_TIMEOUT 180000  // 配置模式超时时间（3分钟）
+#define TIMEZONE_EEPROM_ADDR 300  // 时区偏移存储地址（单位：秒）
+bool configMode = false;            // 是否处于配置模式
+unsigned long configStartTime = 0;  // 配置模式开始时间
+unsigned long lastTimeCalibrationMillis = 0;  // 上次时间校准的时间戳
+bool firstBoot = true;                        // 第一次启动标志，用于控制首次时间校准
+char wifi_ssid[32] = {0};                     // 存储WiFi SSID
+char wifi_password[64] = {0};                 // 存储WiFi密码
+
+// WiFi和Web服务器
+const char* ap_ssid = "S.R.U HealthStation";  // 配置模式的AP名称
+const char* ap_password = "12345678";   // 配置模式的AP密码
+WebServer server(80);                   // Web服务器
+DNSServer dnsServer;                    // DNS服务器，用于捕获所有DNS请求
+
+// NTP服务器
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 8 * 3600;  // 中国是UTC+8
+const int   daylightOffset_sec = 0;    // 如果有夏令时，这里设置为3600
+
+// ==== 函数前向声明 ====
+void drawSyncStatusBox();
+void displayTimeInHealthMode();
+void drawStatusText();
+void displayData(float hr, float spO2);
+void startCalibration();
+void handleCalibration();
+void setupHealthDisplay();
+void switchToClockMode();
+void switchToHealthMode();
+void turnScreenOn();
+void turnScreenOff();
+void setup_display();
+bool setup_sensor();
+bool setup_rtc();
+void clearWiFiCredentials();
+// 其他函数的前向声明...
+
+// ==== 对象定义 ====
+Adafruit_ST7789 tft = Adafruit_ST7789(&SPI, TFT_CS, TFT_DC, TFT_RST);
+MAX30105 pox;
+RTC_PCF8563 rtc; // PCF8563 RTC模块
+
+// ==== 模式定义 ====
+#define MODE_CLOCK 0
+#define MODE_HEALTH 1
+int currentMode = MODE_CLOCK; // 默认为时钟模式
+
+// ==== 状态变量 ====
+bool fingerPlaced = false;
+uint32_t irValue = 0, redValue = 0;
+bool rtcAvailable = false; // RTC模块是否可用
+
+float heartRate = 0;
+float spo2 = 0;
+
+unsigned long lastBeatTime = 0;
+int bufferIndex = 0;
+
+const int spo2BufferSize = 100;
+uint32_t irBuffer[spo2BufferSize];
+uint32_t redBuffer[spo2BufferSize];
+
+const int windowSize = 7;
+uint32_t irWindow[windowSize];
+int winIndex = 0;
+
+const int bufferSize = 6; // 每6秒更新一次
+float hrBuffer[bufferSize] = {0};
+float spO2Buffer[bufferSize] = {0};
+int hrBufferIndex = 0;
+int spO2BufferIndex = 0;
+unsigned long lastUpdateMillis = 0;
+unsigned long lastClockUpdateMillis = 0; // 时钟更新计时器
+
+// ==== 校准相关变量 ====
+bool calibrationMode = false;
+unsigned long calibrationStartTime = 0;
+const unsigned long CALIBRATION_DURATION = 10000; // 10秒校准时间
+uint32_t calibrationSamples[100]; // 存储校准样本
+int calibrationCount = 0;
+uint32_t personalThreshold = FINGER_THRESHOLD; // 默认阈值
+
+// ==== 峰值检测（改进）====
+bool detectPeak(uint32_t* vals, int len) {
+  for (int i = 1; i < len - 1; i++) {
+    if (vals[i] > vals[i - 1] && vals[i] > vals[i + 1]) return true;
+  }
+  return false;
+}
+
+// 计算平均值并去除异常值
+float calculateAverage(float *buffer, int size) {
+  float sum = 0;
+  int validCount = 0;
+  for (int i = 0; i < size; i++) {
+    if (buffer[i] > 0) { // 只计算非零值
+      // 针对HR和SpO2做更严格的过滤
+      if ((buffer == hrBuffer && buffer[i] >= 40 && buffer[i] <= 180) ||
+          (buffer == spO2Buffer && buffer[i] >= 80 && buffer[i] <= 100)) {
+        sum += buffer[i];
+        validCount++;
+      }
+    }
+  }
+  return validCount > 0 ? sum / validCount : 0;
+}
+
+// ==== 时钟显示函数 ====
+void displayClock() { 
+  // ==== 新增：顶部校准提示和进度条 ====
+  if (timeCalibrating) { 
+    unsigned long elapsed = millis() - calibrationStartMillis; 
+    int progress = map(elapsed, 0, TIME_CALIBRATION_MAX_DURATION, 0, 100); 
+    if (progress > 100) progress = 100;  // 防止超过100%
+
+    // 绘制黄色背景条
+    tft.fillRect(0, 0, 320, 20, CUSTOM_YELLOW); 
+    // 绘制提示文字
+    tft.setTextSize(1); 
+    tft.setTextColor(ST7789_BLACK); 
+    tft.setCursor(6, 4); 
+    tft.print("syncing with NTP server..."); 
+    tft.print(progress); tft.print("%"); 
+    // 绘制进度条外框
+    tft.drawRect(280, 5, 30, 10, ST7789_BLACK); 
+    // 绘制进度填充
+    tft.fillRect(280, 5, progress * 30 / 100, 10, ST7789_GREEN); 
+  } 
+
+  static String lastTimeStr = "";  // 记录上一次显示的时间字符串
+  static String lastDateStr = "";  // 记录上一次显示的日期字符串
+  static int16_t lastTimeX_cursor = -1, lastTimeY_cursor = -1;
+  static int16_t lastDateX_cursor = -1, lastDateY_cursor = -1;
+  const int CLEAR_PADDING = 3; 
+
+  if (clockFirstDraw) { 
+    tft.fillScreen(ST7789_BLACK); 
+    clockFirstDraw = false; 
+    lastTimeStr = ""; 
+    lastDateStr = ""; 
+    lastTimeX_cursor = -1; lastTimeY_cursor = -1;
+    lastDateX_cursor = -1; lastDateY_cursor = -1;
+  } 
+  
+  DateTime now; 
+  String timeStr, dateStr; 
+  
+  if (rtcAvailable) { 
+    now = rtc.now(); 
+    char timeBuf[6]; 
+    sprintf(timeBuf, "%02d:%02d", now.hour(), now.minute()); 
+    timeStr = String(timeBuf); 
+    
+    char dateBuf[11]; 
+    sprintf(dateBuf, "%04d/%02d/%02d", now.year(), now.month(), now.day()); 
+    dateStr = String(dateBuf); 
+  } else { 
+    timeStr = "--:--"; 
+    dateStr = "----/--/--"; 
+  } 
+  
+  int16_t x_offset, y_offset; 
+  uint16_t w_bounds, h_bounds; 
+
+  // --- 时间显示优化（修改后） ---
+  if (timeStr != lastTimeStr) { 
+    // 暴力清除时间显示区域（整行擦除）
+    int16_t newY_cursor = 80; 
+    tft.fillRect(0, newY_cursor - 20, 320, 100, ST7789_BLACK); 
+
+    // 计算新时间位置并绘制
+    tft.setTextSize(10); 
+    tft.getTextBounds(timeStr, 0, 0, &x_offset, &y_offset, &w_bounds, &h_bounds); 
+    int16_t newX_cursor = (320 - w_bounds) / 2;  
+    tft.setTextColor(0xC618); 
+    tft.setCursor(newX_cursor, newY_cursor); 
+    tft.print(timeStr); 
+
+    // 更新跟踪变量
+    lastTimeX_cursor = newX_cursor; 
+    lastTimeY_cursor = newY_cursor; 
+    lastTimeStr = timeStr; 
+  } 
+  
+  // --- 日期显示优化（修改后） ---
+  if (dateStr != lastDateStr) { 
+    // 暴力清除日期显示区域（整块擦除）
+    int16_t newY_cursor = 180; 
+    tft.fillRect(0, newY_cursor - 20, 320, 60, ST7789_BLACK); 
+
+    // 计算新日期位置并绘制
+    tft.setTextSize(4); 
+    tft.getTextBounds(dateStr, 0, 0, &x_offset, &y_offset, &w_bounds, &h_bounds); 
+    int16_t newX_cursor = (320 - w_bounds) / 2; 
+    tft.setTextColor(0x8410); 
+    tft.setCursor(newX_cursor, newY_cursor); 
+    tft.print(dateStr); 
+
+    // 更新跟踪变量
+    lastDateX_cursor = newX_cursor;
+    lastDateY_cursor = newY_cursor;
+    lastDateStr = dateStr;
+  }
+
+  drawSyncStatusBox();
+}
+
+// ==== 新增：同步状态提示框绘制函数 ====
+void drawSyncStatusBox() { 
+  const int boxX = 6;    // 左上角X坐标
+  const int boxY = 4;    // 左上角Y坐标
+  const int boxW = 50;   // 宽度
+  const int boxH = 18;   // 高度
+
+  static bool blink = true;          // 闪烁标志
+  static unsigned long lastBlinkTime = 0;  // 上次闪烁时间
+
+  // 每500ms切换一次闪烁状态
+  if (millis() - lastBlinkTime > 500) { 
+    blink = !blink; 
+    lastBlinkTime = millis(); 
+  } 
+
+  // 校准过程中：黄色闪烁框显示SYNCING
+  if (timeCalibrating) { 
+    if (blink) { 
+      tft.fillRect(boxX, boxY, boxW, boxH, CUSTOM_YELLOW);  // 黄色背景
+      tft.setTextColor(ST7789_BLACK);  // 黑色文字
+      tft.setTextSize(1); 
+      tft.setCursor(boxX + 4, boxY + 4);  // 文字位置
+      tft.print("SYNCING"); 
+    } else { 
+      tft.fillRect(boxX, boxY, boxW, boxH, ST7789_BLACK);  // 黑屏隐藏
+    } 
+    return; 
+  } 
+
+  // 成功/失败状态：固定显示3秒
+  if ((showSyncSuccess || showSyncFail) && millis() < syncStatusExpire) { 
+    uint16_t bgColor = showSyncSuccess ? ST7789_GREEN : ST7789_RED;  // 绿/红背景
+    const char* msg = showSyncSuccess ? "DONE" : "FAILED";  // 提示文字
+
+    tft.fillRect(boxX, boxY, boxW, boxH, bgColor);  // 背景填充
+    tft.setTextColor(ST7789_BLACK);  // 黑色文字
+    tft.setTextSize(1); 
+    tft.setCursor(boxX + 10, boxY + 4);  // 文字位置（DONE/FAILED居中）
+    tft.print(msg); 
+    return; 
+  } 
+
+  // 无状态时清理区域
+  tft.fillRect(boxX, boxY, boxW, boxH, ST7789_BLACK); 
+}
+
+// ==== 在健康模式下显示时间 ====
+void displayTimeInHealthMode() {
+  if (!rtcAvailable) return;
+  
+  DateTime now = rtc.now();
+  char timeBuf[6];
+  sprintf(timeBuf, "%02d:%02d", now.hour(), now.minute());
+  
+  // 清除时间区域
+  tft.fillRect(240, 10, 80, 20, ST7789_BLACK);
+  
+  // 显示时间
+  tft.setTextSize(2);
+  tft.setTextColor(ST7789_WHITE);
+  tft.setCursor(240, 10);
+  tft.print(timeBuf);
+}
+
+// ==== 状态提示文本显示（黄色条幅）====
+void drawStatusText() {
+  static bool lastFingerState = false;
+  static bool firstDraw = true;
+
+  // 首次启动或状态变化时更新
+  if (firstDraw || fingerPlaced != lastFingerState) {
+    // 黄色条幅（底色为黄色，文字为黑色）- 减小高度
+    tft.fillRect(0, 85, 320, 20, CUSTOM_YELLOW); // 黄色背景条，高度减小
+
+    tft.setTextSize(2);
+    tft.setTextColor(ST7789_BLACK); // 黑色文字
+
+    // 计算文本宽度以居中显示
+    String message = fingerPlaced ? ">>  MEASURING  <<" : ">> PUT YOUR FINGER <<";
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(message, 0, 0, &x1, &y1, &w, &h);
+    int16_t x = (320 - w) / 2;
+    
+    tft.setCursor(x, 87); // 居中显示，调整垂直位置
+    tft.println(message);
+
+    lastFingerState = fingerPlaced;
+    firstDraw = false;
+  }
+}
+
+// ==== 主数据显示（优化布局）====
+void displayData(float hr, float spO2) {
+  static float lastHR = -1;
+  static float lastSpO2 = -1;
+
+  if (hr != lastHR || spO2 != lastSpO2) {
+    char hrStr[10], spoStr[10];
+    char hrUnit[] = " BPM";
+    char spoUnit[] = "%";
+
+    // 格式化为三位数（不足补0）
+    if (hr == 0) sprintf(hrStr, "---"); else sprintf(hrStr, "%03d", (int)hr);
+    if (spO2 == 0) sprintf(spoStr, "---"); else sprintf(spoStr, "%03d", (int)spO2);
+
+    // 清除整个数据区域
+    tft.fillRect(0, 130, 320, 110, ST7789_BLACK);
+
+    // HR 标签（左侧）- 小一号字体
+    tft.setTextSize(2); 
+    tft.setTextColor(ST7789_CYAN);
+    tft.setCursor(20, 135);
+    tft.print("HR:");
+
+    // HR 数值 - 大号字体
+    tft.setTextSize(4); 
+    tft.setTextColor(ST7789_WHITE);
+    tft.setCursor(20, 160);
+    tft.print(hrStr);
+    
+    // HR 单位 - 小号字体
+    tft.setTextSize(2);
+    tft.setCursor(20 + strlen(hrStr) * 24, 175); // 调整单位位置
+    tft.print(hrUnit);
+
+    // SpO2 标签（右侧）- 小一号字体
+    tft.setTextSize(2);
+    tft.setTextColor(ST7789_CYAN);
+    tft.setCursor(170, 135);
+    tft.print("SpO2:");
+
+    // SpO2 数值 - 大号字体
+    tft.setTextSize(4);
+    tft.setTextColor(ST7789_WHITE);
+    tft.setCursor(170, 160);
+    tft.print(spoStr);
+    
+    // SpO2 单位 - 小号字体
+    tft.setTextSize(2);
+    tft.setCursor(170 + strlen(spoStr) * 24, 175); // 调整单位位置
+    tft.print(spoUnit);
+
+    lastHR = hr;
+    lastSpO2 = spo2;
+  }
+}
+
+// ==== 校准函数 ====
+void startCalibration() {
+  calibrationMode = true;
+  calibrationStartTime = millis();
+  calibrationCount = 0;
+  
+  // 显示校准开始提示
+  tft.fillRect(0, 85, 320, 20, ST7789_CYAN);
+  tft.setTextColor(ST7789_BLACK);
+  tft.setTextSize(2);
+  String message = "CALIBRATING...";
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(message, 0, 0, &x1, &y1, &w, &h);
+  int16_t x = (320 - w) / 2;
+  tft.setCursor(x, 87);
+  tft.print(message);
+  
+  // 清除数据区域并显示指导信息
+  tft.fillRect(0, 130, 320, 110, ST7789_BLACK);
+  tft.setTextColor(ST7789_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 140);
+  tft.println("Place finger firmly");
+  tft.setCursor(20, 165);
+  tft.println("on sensor and hold");
+  tft.setCursor(20, 190);
+  tft.println("for 10 seconds");
+}
+
+// ==== 处理校准 ====
+void handleCalibration() {
+  if (!calibrationMode) return;
+  
+  unsigned long elapsedTime = millis() - calibrationStartTime;
+  
+  // 显示进度条
+  int progressWidth = map(elapsedTime, 0, CALIBRATION_DURATION, 0, 280);
+  tft.fillRect(20, 220, 280, 10, ST7789_BLACK); // 清除进度条区域
+  tft.fillRect(20, 220, progressWidth, 10, ST7789_GREEN); // 绘制进度条
+  
+  // 采集样本
+  if (elapsedTime % 100 == 0 && calibrationCount < 100 && irValue > 1000) { // 每100ms采集一次，并确保有有效读数
+    calibrationSamples[calibrationCount++] = irValue;
+  }
+  
+  // 校准完成
+  if (elapsedTime >= CALIBRATION_DURATION) {
+    // 计算个人阈值
+    uint32_t sum = 0;
+    int validSamples = 0;
+    
+    for (int i = 0; i < calibrationCount; i++) {
+      if (calibrationSamples[i] > 1000) { // 忽略明显无效的样本
+        sum += calibrationSamples[i];
+        validSamples++;
+      }
+    }
+    
+    // 设置个人阈值为平均值的80% (或更高，根据实际测试效果调整)
+    if (validSamples > 0) {
+      uint32_t avg = sum / validSamples;
+      personalThreshold = avg * 0.8; // 调整为更保守的80%
+      
+      // 确保阈值在合理范围内
+      if (personalThreshold < 2000) personalThreshold = 2000; // 提高最低阈值，避免误判
+      if (personalThreshold > 60000) personalThreshold = 60000; // 调整最高阈值
+      
+      // 保存到EEPROM
+      EEPROM.put(EEPROM_ADDR_THRESHOLD, personalThreshold);
+      EEPROM.commit();
+      Serial.print("New personalThreshold saved: ");
+      Serial.println(personalThreshold);
+    } else {
+      Serial.println("Calibration failed: No valid samples collected.");
+      personalThreshold = FINGER_THRESHOLD; // 校准失败，恢复默认阈值
+    }
+    
+    // 显示校准完成
+    tft.fillRect(0, 85, 320, 20, CUSTOM_YELLOW);
+    tft.setTextColor(ST7789_BLACK);
+    String message = "CALIBRATION DONE!";
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(message, 0, 0, &x1, &y1, &w, &h);
+    int16_t x = (320 - w) / 2;
+    tft.setCursor(x, 87);
+    tft.print(message);
+    
+    // 显示新阈值
+    tft.fillRect(0, 130, 320, 110, ST7789_BLACK);
+    tft.setTextSize(2);
+    tft.setTextColor(ST7789_CYAN);
+    tft.setCursor(20, 140);
+    tft.print("New threshold: ");
+    tft.setTextColor(ST7789_WHITE);
+    tft.print(personalThreshold);
+    
+    tft.setTextColor(ST7789_CYAN);
+    tft.setCursor(20, 170);
+    tft.print("Valid samples: ");
+    tft.setTextColor(ST7789_WHITE);
+    tft.print(validSamples);
+    
+    tft.setTextColor(ST7789_GREEN);
+    tft.setCursor(20, 200);
+    tft.print("Settings saved!");
+    
+    delay(3000); // 延迟3秒显示结果
+    
+    calibrationMode = false;
+    
+    // 恢复正常显示
+    setupHealthDisplay(); // 重新绘制健康模式界面
+    drawStatusText();
+    displayData(0, 0); // 重置显示
+  }
+}
+
+// ==== 显示健康站界面 ====
+void setupHealthDisplay() {
+  tft.fillScreen(ST7789_BLACK);
+
+  // 标题行（模拟粗体）- 下移到离横幅2像素的位置
+  tft.setTextSize(3); 
+  tft.setCursor(15, 29);  // 从21改为26，下移5像素
+  tft.setTextColor(ST7789_CYAN);
+  tft.println("HEALTH STATION");
+
+  // 子标题 - 靠左显示并上移2像素
+  tft.setTextSize(2);
+  tft.setCursor(15, 59);  // 从50改为55，下移5像素
+  tft.setTextColor(ST7789_CYAN);
+  tft.println("<SENSOR READY>");
+  
+  // 黄色条幅
+  tft.fillRect(0, 85, 320, 20, CUSTOM_YELLOW);
+  
+  // 显示校准按钮提示
+  tft.setTextSize(1);
+  tft.setTextColor(ST7789_WHITE);
+  tft.setCursor(5, 230);
+  tft.print("Press button to calibrate");
+  
+  // 显示当前阈值
+  tft.setTextColor(ST7789_WHITE);
+  tft.setCursor(200, 230);
+  tft.print("Threshold: ");
+  tft.print(personalThreshold);
+  
+  // 显示时间（如果RTC可用）
+  if (rtcAvailable) {
+    displayTimeInHealthMode();
+  }
+  
+  // 初始化状态提示
+  drawStatusText();
+  
+  // 初始化数据显示
+  displayData(0, 0);
+}
+
+// ==== 切换到时钟模式 ====
+void switchToClockMode() {
+  if (currentMode == MODE_CLOCK) return;
+  
+  currentMode = MODE_CLOCK;
+  clockFirstDraw = true;  // 使用全局变量
+  displayClock();
+  Serial.println("Switched to Clock Mode");
+}
+
+// ==== 切换到健康站模式 ====
+void switchToHealthMode() {
+  if (currentMode == MODE_HEALTH) return;
+  
+  currentMode = MODE_HEALTH;
+  setupHealthDisplay();
+  Serial.println("Switched to Health Mode");
+}
+// ==== 屏幕控制函数 ====
+void turnScreenOn() {
+  if (!screenOn) {
+    digitalWrite(TFT_BL, HIGH);
+    screenOn = true;
+    Serial.println("Screen ON");
+    // 不在此处强制刷新，由loop根据模式刷新
+  }
+}
+
+void turnScreenOff() {
+  if (screenOn) {
+    digitalWrite(TFT_BL, LOW);
+    screenOn = false;
+    Serial.println("Screen OFF");
+  }
+}
+
+// ==== 显示初始化 ====
+void setup_display() {
+  if (TFT_BL != -1) {
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH); // 默认开启
+  }
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, -1);
+  tft.init(240, 320); // 横屏初始化
+  tft.setRotation(1); // 设置为横屏方向
+  tft.fillScreen(ST7789_BLACK);
+}
+
+// ==== 传感器初始化 ====
+bool setup_sensor() {
+  Wire.begin(MAX30102_SDA, MAX30102_SCL);
+  if (!pox.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 sensor not found. Check wiring/power.");
+    return false;
+  }
+  pox.setup(0x1F, 4, 2, 400, 411, 4096);
+  pox.setPulseAmplitudeRed(0x1F);
+  pox.setPulseAmplitudeIR(0x1F);
+  pox.setPulseAmplitudeGreen(0);
+  Serial.println("MAX30105 sensor initialized.");
+  return true;
+}
+
+// ==== RTC初始化 ====
+bool setup_rtc() {
+  if (!rtc.begin()) {
+    Serial.println("RTC PCF8563 not found. Check wiring.");
+    return false;
+  }
+  Serial.println("RTC initialized.");
+
+  // Fix for Problem 2 (previous round): Check if RTC time is valid (e.g., year is reasonable)
+  DateTime now = rtc.now();
+  // If RTC lost power, or if the year is clearly out of range (e.g., before 2020 or far beyond current reasonable limits),
+  // assume time is bad and reset it to compile time.
+  if (rtc.lostPower() || now.year() < 2020 || now.year() > 2099) { 
+    Serial.println("RTC time is invalid or lost power, setting time to compile time.");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    // Read again to confirm it's set and print for debugging
+    now = rtc.now();
+    Serial.print("RTC reset to: ");
+    Serial.print(now.year(), DEC); Serial.print('/');
+    Serial.print(now.month(), DEC); Serial.print('/');
+    Serial.print(now.day(), DEC); Serial.print(" ");
+    Serial.print(now.hour(), DEC); Serial.print(':');
+    Serial.print(now.minute(), DEC); Serial.print(':');
+    Serial.print(now.second(), DEC); Serial.println();
+  }
+  return true;
+}
+
+// Add a function to clear WiFi credentials
+void clearWiFiCredentials() {
+  memset(wifi_ssid, 0, sizeof(wifi_ssid));
+  memset(wifi_password, 0, sizeof(wifi_password));
+  EEPROM.put(WIFI_EEPROM_ADDR, wifi_ssid); // Write zeros to EEPROM (SSID is enough for first byte check)
+  int passwordAddr = WIFI_EEPROM_ADDR + sizeof(wifi_ssid);
+  EEPROM.put(passwordAddr, wifi_password); // Clear password too for completeness
+  EEPROM.commit(); 
+  Serial.println("WiFi credentials cleared from EEPROM.");
+}
+
+// 保存WiFi凭据到EEPROM
+void saveWiFiCredentials() {
+  // Clear buffers before copying to ensure null termination and prevent old data
+  memset(wifi_ssid, 0, sizeof(wifi_ssid));
+  memset(wifi_password, 0, sizeof(wifi_password));
+  
+  // Copy new credentials, ensuring they don't overflow the buffers
+  strncpy(wifi_ssid, server.arg("ssid").c_str(), sizeof(wifi_ssid) - 1);
+  strncpy(wifi_password, server.arg("password").c_str(), sizeof(wifi_password) - 1);
+
+  // Explicitly ensure null termination, though strncpy with size-1 should handle it
+  wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
+  wifi_password[sizeof(wifi_password) - 1] = '\0';
+
+  EEPROM.put(WIFI_EEPROM_ADDR, wifi_ssid);
+  EEPROM.put(WIFI_EEPROM_ADDR + sizeof(wifi_ssid), wifi_password);
+  EEPROM.commit();
+  Serial.println("WiFi credentials saved to EEPROM.");
+}
+
+// 从EEPROM加载WiFi凭据
+bool loadWiFiCredentials() {
+  EEPROM.get(WIFI_EEPROM_ADDR, wifi_ssid);
+  EEPROM.get(WIFI_EEPROM_ADDR + sizeof(wifi_ssid), wifi_password);
+  
+  // Ensure strings are null-terminated
+  wifi_ssid[sizeof(wifi_ssid) - 1] = '\0';
+  wifi_password[sizeof(wifi_password) - 1] = '\0';
+
+  Serial.print("Loaded SSID: '");
+  Serial.print(wifi_ssid);
+  Serial.println("'");
+
+  // Check for valid WiFi credentials: first character is not 0 and string length is greater than 0
+  return (wifi_ssid[0] != 0 && strlen(wifi_ssid) > 0);
+}
+
+// **终极HTML内容，修复乱码问题并优化标题结构**
+const char* html_page = R"rawliteral(
+<!DOCTYPE html> 
+<html> 
+<head> 
+  <title>S.R.U Health Station 设置 / Setup</title> 
+  <meta charset="UTF-8"> 
+  <meta name="viewport" content="width=device-width, initial-scale=1"> 
+  <style> 
+    body { 
+      font-family: Arial, sans-serif; 
+      background-color: #f3f3f3; 
+      padding: 20px; 
+      color: #333; 
+    } 
+    .container { 
+      max-width: 420px; 
+      background-color: white; 
+      padding: 30px; 
+      margin: auto; 
+      border-radius: 10px; 
+      box-shadow: 0 4px 8px rgba(0,0,0,0.1); 
+    } 
+    h1 { 
+      text-align: center; 
+      color: #0077cc; 
+      margin-bottom: 14px; 
+      font-size: 22px; 
+    } 
+    h2 { 
+      text-align: center; 
+      color: #0077cc; 
+      font-size: 16px; 
+      margin-top: 0; 
+      margin-bottom: 20px; 
+    } 
+    label { 
+      font-weight: bold; 
+      display: block; 
+      margin-top: 15px; 
+      color: #444; 
+    } 
+    .subtext { 
+      font-size: 12px; 
+      color: #666; 
+      margin-bottom: 6px; 
+    } 
+    input[type="text"], 
+    input[type="password"], 
+    input[type="number"] { 
+      width: calc(100% - 16px); 
+      padding: 10px; 
+      font-size: 16px; 
+      margin-bottom: 15px; 
+      border: 1px solid #ccc; 
+      border-radius: 4px; 
+    } 
+    input[type="submit"] { 
+      background-color: #28a745; 
+      color: white; 
+      border: none; 
+      border-radius: 5px; 
+      padding: 12px; 
+      font-size: 18px; 
+      cursor: pointer; 
+      width: 100%; 
+    } 
+    input[type="submit"]:hover { 
+      background-color: #218838; 
+    } 
+    p { 
+      font-size: 13px; 
+      color: #555; 
+      text-align: center; 
+    } 
+  </style> 
+</head> 
+<body> 
+  <div class="container"> 
+    <h1>S.R.U 健康站设置</h1> 
+    <h2>S.R.U Health Station Configuration</h2> 
+    
+    <p>请填写WiFi和时区信息<br><span class="subtext">Please fill in your WiFi and timezone information</span></p> 
+    
+    <form method="post" action="/save"> 
+      <label for="ssid">WiFi 名称</label> 
+      <div class="subtext">SSID</div> 
+      <input type="text" id="ssid" name="ssid" required> 
+
+      <label for="password">WiFi 密码</label> 
+      <div class="subtext">Password</div> 
+      <input type="password" id="password" name="password"> 
+
+      <label for="timezone">时区偏移（单位：小时）</label> 
+      <div class="subtext">Time Zone (UTC Offset in hours, e.g. +8, -5)</div> 
+      <input type="number" id="timezone" name="timezone" value="8" min="-12" max="14" required> 
+
+      <input type="submit" value="保存并连接 / Done"> 
+    </form> 
+  </div> 
+</body> 
+</html> 
+)rawliteral";
+
+// 设置Web服务器路由
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", html_page);
+  });
+  
+  server.on("/save", HTTP_POST, []() {
+    saveWiFiCredentials(); // 调用新的保存函数
+
+    // 处理时区偏移（小时转秒）
+    int timezoneOffsetHours = server.arg("timezone").toInt();
+    long gmtOffset_sec = timezoneOffsetHours * 3600;
+    EEPROM.put(TIMEZONE_EEPROM_ADDR, gmtOffset_sec);
+    EEPROM.commit();
+
+    server.send(200, "text/html", 
+      "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
+      "<meta charset='UTF-8'></head>"
+      "<body style='font-family: Arial; padding: 20px; text-align: center;'>"
+      "<h2 style='color: #009688;'>设置成功 ✅</h2>"
+      "<p style='font-size:16px; color:#333;'>WiFi和时区设置已成功，设备将尝试连接网络并自动同步时间。</p>"
+      "<p style='font-size:14px; color:#666;'>稍后您可以关闭此页面，设备将正常工作。</p>"
+      "<hr style='margin: 25px 0;'>"
+      "<h1 style='color: #0066cc;'>Settings Saved</h1>"
+      "<p>WiFi credentials and timezone offset have been saved.</p>"
+      "<p>The device will now connect to your network and synchronize time using NTP.</p>"
+      "<p>You can now close this page and return to normal operation.</p>"
+      "</body></html>");
+
+    delay(1000); // 延迟一下，确保响应被发送
+
+    configMode = false; // 退出配置模式
+    Serial.println("Exiting config mode after saving WiFi credentials.");
+  });
+  
+  server.onNotFound([]() {
+    server.send(200, "text/html", html_page);
+  });
+  
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+// 进入配置模式
+void enterConfigMode() {
+  Serial.println("Entering Config Mode...");
+  // 确保屏幕保持开启状态
+  turnScreenOn();
+  lastActivityTime = millis();
+  
+  // 显示进入配置模式的消息
+  tft.fillScreen(ST7789_BLACK); 
+  tft.setTextSize(2); 
+  tft.setTextColor(ST7789_CYAN);
+  tft.setCursor(20, 40);
+  tft.println("WiFi Setup Mode");
+  
+  tft.setTextSize(2); // Problem 1 Fix: 加大指示文本字体
+  tft.setTextColor(ST7789_WHITE);
+  tft.setCursor(10, 80);  tft.println("1. Connect to Wi-Fi AP:");
+  tft.setCursor(10, 160); tft.println("2. Browse to:");   // Adjusted Y
+  tft.setCursor(10, 215); tft.println("3. Enter Wi-Fi details");   // Adjusted Y
+  tft.setTextColor(CUSTOM_YELLOW);  
+  tft.setCursor(10, 105); tft.println("SSID: S.R.U HealthStation"); // Adjusted Y
+  tft.setCursor(10, 130); tft.println("Password: 12345678");       // Adjusted Y (more space)
+  tft.setCursor(10, 185); tft.println("http://192.168.4.1 ");   // Adjusted Y
+  
+
+  
+  // 设置AP模式
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
+  delay(500); // 给AP一点时间启动
+  
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // 设置DNS服务器，捕获所有DNS请求
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  
+  // 设置Web服务器
+  setupWebServer();
+  
+  // 标记为配置模式
+  configMode = true;
+  configStartTime = millis();
+  
+  // 显示IP地址 (静态信息，只需绘制一次)
+  tft.setCursor(20, 245); // Adjusted Y for IP address (using setTextSize 2)
+  tft.print("AP IP: ");
+  tft.print(WiFi.softAPIP().toString());
+}
+
+bool calibrateTime() {
+  if (!rtcAvailable) {
+    Serial.println("RTC not available, skipping time calibration.");
+    return false;
+  }
+  
+  if (wifi_ssid[0] == 0 || strlen(wifi_ssid) == 0) {
+    Serial.println("No WiFi credentials, skipping time calibration.");
+    return false;
+  }
+  
+  Serial.println("Starting time calibration...");
+  
+  // 连接WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
+  Serial.print("Connecting to WiFi ");
+  Serial.print(wifi_ssid);
+  
+  // 等待连接，最多等待15秒
+  int wifiTimeout = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 150) { // 150 * 100ms = 15s
+    delay(100);
+    wifiTimeout++;
+    Serial.print(".");
+  }
+  Serial.println();
+  
+  bool success = false;
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected. Configuring time...");
+    // 读取EEPROM中的时区偏移（默认8小时）
+    long savedGmtOffset = 8 * 3600;
+    EEPROM.get(TIMEZONE_EEPROM_ADDR, savedGmtOffset);
+    configTime(savedGmtOffset, daylightOffset_sec, ntpServer);
+    
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 10000)) { // Wait up to 10 seconds for NTP
+      Serial.println("Time received from NTP.");
+      rtc.adjust(DateTime(
+        timeinfo.tm_year + 1900,
+        timeinfo.tm_mon + 1,
+        timeinfo.tm_mday,
+        timeinfo.tm_hour,
+        timeinfo.tm_min,
+        timeinfo.tm_sec
+      ));
+      success = true;
+    } else {
+      Serial.println("Failed to get time from NTP!");
+    }
+    
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WiFi disconnected.");
+  } else {
+    Serial.println("WiFi connection failed!");
+    clearWiFiCredentials();
+  }
+  
+  lastTimeCalibrationMillis = millis(); // 更新上次校准时间
+
+  timeCalibrating = false;
+
+  // ==== 新增：设置成功/失败状态 ====
+  if (success) {  // 假设success是校准结果标志
+    showSyncSuccess = true;
+    syncStatusExpire = millis() + 3000;  // 3秒后过期
+  } else {
+    showSyncFail = true;
+    syncStatusExpire = millis() + 3000;  // 3秒后过期
+  }
+
+  return success;
+}
+
+// ==== 主程序 ====
+void setup() {
+  Serial.begin(115200); 
+  delay(500); // 等待串口稳定 
+  Serial.println("\nDevice starting up...");
+  
+  // 初始化WiFi但不连接 
+  WiFi.mode(WIFI_OFF); 
+  WiFi.persistent(false); // 不保存WiFi连接信息到Flash，由EEPROM管理 
+
+  // 初始化EEPROM 
+  EEPROM.begin(512); // 确保EEPROM有足够空间 
+  
+  // 读取保存的阈值 
+  EEPROM.get(EEPROM_ADDR_THRESHOLD, personalThreshold); 
+  
+  // 检查阈值是否有效，无效则使用默认值 
+  if (personalThreshold < 1000 || personalThreshold > 60000) { // 调整阈值范围
+    personalThreshold = FINGER_THRESHOLD; 
+    Serial.print("Invalid threshold read, using default: ");
+    Serial.println(personalThreshold);
+  } else {
+    Serial.print("Loaded personal threshold: ");
+    Serial.println(personalThreshold);
+  }
+  
+  // 设置校准按钮 
+  pinMode(CALIBRATION_BTN, INPUT_PULLUP); 
+
+  // 关键调整：提前初始化显示，确保后续显示操作可用 
+  setup_display(); 
+  
+  // 初始化RTC 
+  rtcAvailable = setup_rtc(); 
+  
+  // 关键调整：在显示初始化后加载WiFi凭据
+  bool hasWiFi = loadWiFiCredentials(); 
+  
+  // 第一次上电且没有WiFi凭据时，自动进入配置模式
+  if (!hasWiFi) { 
+    tft.fillScreen(ST7789_BLACK); 
+    tft.setTextSize(2); tft.setTextColor(ST7789_CYAN); tft.setCursor(20, 40); tft.println("First Time Setup"); 
+    tft.setTextSize(2); tft.setTextColor(ST7789_WHITE); // Problem 1 Fix: 加大字体
+    tft.setCursor(20, 80); tft.println("Please configure WiFi"); 
+    tft.setCursor(20, 105); tft.println("to enable automatic time"); 
+    tft.setCursor(20, 130); tft.println("calibration."); 
+    
+    delay(3000); // 显示3秒 
+    
+    enterConfigMode(); // 自动进入配置模式 
+  } else { // 如果有WiFi凭据
+    // firstBoot 仍为true，以便在loop()中尝试校准时间
+  }
+  
+  // 初始化传感器（失败时需要显示错误信息，屏幕已初始化） 
+  if (!setup_sensor()) { 
+    tft.fillScreen(ST7789_BLACK); 
+    tft.fillRect(0, 85, 320, 20, ST7789_RED); // 红色错误背景 
+    tft.setTextColor(ST7789_BLACK); 
+    
+    String errorMsg = "SENSOR FAILED!";
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(errorMsg, 0, 0, &x1, &y1, &w, &h);
+    int16_t x = (320 - w) / 2;
+    tft.setCursor(x, 87);
+    tft.println(errorMsg);
+    Serial.println("Sensor initialization failed. Halting.");
+    while (true); // 传感器失败是严重错误，停止运行
+  } 
+  
+  // 初始化屏幕状态变量 
+  screenOn = true;
+  lastActivityTime = millis();
+  
+  // 默认显示时钟模式，但如果已进入配置模式则不切换
+  if (!configMode) {
+    switchToClockMode(); 
+
+    // ==== 新增：立即启动时间校准提示 ====
+    timeCalibrating = true; 
+    calibrationStartMillis = millis(); 
+    displayClock(); // 强制刷新显示，避免黑屏
+  }
+}
+
+// ==== 主循环 ====
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  // ==== 新增：整点前5秒自动激活屏幕 ====
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    // 检查是否为整点前5秒（分钟59，秒55-59）
+    if (now.minute() == 59 && now.second() >= 55) {
+      if (!screenOn) {  // 屏幕当前关闭时激活
+        Serial.println("Auto activating screen before hour change");
+        turnScreenOn();  // 打开屏幕背光
+        lastActivityTime = currentMillis;  // 更新活动时间，避免立即关闭
+      }
+    }
+  }
+  
+  // ==== 新增：状态自动清除 ====
+  if ((showSyncSuccess || showSyncFail) && currentMillis > syncStatusExpire) {
+    showSyncSuccess = false;
+    showSyncFail = false;
+  }
+
+  // 1. 检测长按校准按钮进入配置模式（无论当前在什么模式，都可以触发）
+  static bool buttonPressed = false;
+  static unsigned long buttonPressStartTime = 0;
+  
+  if (digitalRead(CALIBRATION_BTN) == LOW) { // 按钮处于按下状态
+    if (!buttonPressed) { // 首次检测到按钮按下
+        buttonPressed = true;
+        buttonPressStartTime = currentMillis;
+    } else if (!configMode && (currentMillis - buttonPressStartTime > CONFIG_BUTTON_TIMEOUT)) {
+        // 长按超过5秒，进入配置模式
+        Serial.println("Long press detected, entering config mode.");
+        enterConfigMode(); 
+        return; // 立即返回，确保配置模式逻辑接管，避免其他代码干扰
+    }
+  } else { // 按钮处于松开状态
+    if (buttonPressed) { // 按钮刚从按下状态松开
+        // 检查是否是短按以触发校准 (仅当不在配置模式且处于健康模式时)
+        if (!configMode && currentMode == MODE_HEALTH && 
+            (currentMillis - buttonPressStartTime > 50) && // 消抖：按压时间超过50ms
+            (currentMillis - buttonPressStartTime < CONFIG_BUTTON_TIMEOUT)) { // 且未达到长按阈值
+            Serial.println("Short press detected, starting calibration.");
+            startCalibration(); 
+        }
+        buttonPressed = false; // 重置按钮状态
+    }
+  }
+  
+  // 2. 处理配置模式（最高优先级）
+  if (configMode) {
+    turnScreenOn(); // 在配置模式下强制屏幕常亮
+    lastActivityTime = currentMillis; // 更新活动时间，避免超时关闭
+
+    dnsServer.processNextRequest();
+    server.handleClient();
+    
+    static unsigned long lastConfigRefreshTime = 0;
+    if (currentMillis - lastConfigRefreshTime > 1000) { // 每秒刷新一次
+      lastConfigRefreshTime = currentMillis;
+      
+      // Problem 3.2 Fix: 只清除并重绘动态变化的文本，而不是全屏重绘
+      // The text "Time remaining: XX sec" will be drawn at (15, 265) with size 2.
+      // A safe clear area would be around 200 pixels wide and 20 pixels high for setTextSize(2)
+      tft.fillRect(15, 265, 200, 20, ST7789_BLACK); 
+
+      int remainingTime = (WIFI_CONFIG_TIMEOUT - (currentMillis - configStartTime)) / 1000;
+      if (remainingTime < 0) remainingTime = 0;
+      
+      tft.setTextSize(2); // Problem 1 Fix: 确保此处也是加大字体
+      tft.setCursor(15, 265); 
+      tft.print("Time remaining: "); tft.print(remainingTime); tft.print(" sec");
+    }
+    
+    // 检查配置模式是否超时
+    if (currentMillis - configStartTime > WIFI_CONFIG_TIMEOUT) {
+      configMode = false; // 配置模式超时，退出
+      WiFi.mode(WIFI_OFF); // 关闭WiFi
+      Serial.println("Config mode timed out, returning to normal operation.");
+      
+      // 恢复正常显示
+      turnScreenOn(); // 确保屏幕开启以便过渡
+      if (currentMode == MODE_CLOCK) {
+        clockFirstDraw = true;
+        displayClock();
+      } else {
+        setupHealthDisplay();
+      }
+    }
+    
+    return; // 在配置模式下，跳过所有其他正常操作逻辑
+  }
+  
+  // 3. 正常操作逻辑（只有在非配置模式下执行）
+  
+  // 第一次启动自动校准时间（仅在loop中触发一次）
+  if (firstBoot && rtcAvailable && wifi_ssid[0] != 0) {
+    Serial.println("First boot: Attempting time calibration.");
+    calibrateTime();
+    firstBoot = false; // 标记为已校准，避免重复
+  }
+  
+  // 检查是否需要在整点校准时间（每小时，距离上次校准至少30分钟）
+  if (rtcAvailable && wifi_ssid[0] != 0) {
+    DateTime now = rtc.now();
+    // Use fixed unsigned long literal for 30 minutes to avoid overflow issues
+    if (now.minute() == 0 && now.second() == 0 && 
+        (currentMillis - lastTimeCalibrationMillis > 30UL * 60UL * 1000UL)) {
+      Serial.println("Hourly time calibration triggered.");
+      calibrateTime();
+    }
+  }
+  
+  // 读取传感器数据（在进入模式判断前读取，确保irValue最新）
+  pox.check();
+  irValue = pox.getIR();
+  redValue = pox.getRed(); // Correctly use getRed for Red value
+  
+  // 使用个人化阈值检测手指是否放置
+  fingerPlaced = irValue > personalThreshold;
+  
+  // 屏幕超时和自动开关逻辑
+  // 任何手指放置或按钮按下都算作活动
+  bool activity = fingerPlaced || (digitalRead(CALIBRATION_BTN) == LOW);
+  
+  if (activity) {
+    lastActivityTime = currentMillis;
+    turnScreenOn();
+  } else if (screenOn && (currentMillis - lastActivityTime > SCREEN_TIMEOUT)) {
+    turnScreenOff();
+  }
+  
+  // 如果屏幕关闭，只检测活动，不执行其他测量和显示逻辑
+  if (!screenOn) {
+    return;
+  }
+  
+  // 4. 模式切换逻辑
+  if (currentMode == MODE_CLOCK) {
+    // 时钟模式下，检测是否需要切换到健康站模式
+    if (irValue > personalThreshold + 5000) { // 检测到明显的手指（比阈值高一些，避免误触）
+      switchToHealthMode();
+    } else {
+      // 更新时钟显示（每秒更新一次）
+      if (currentMillis - lastClockUpdateMillis >= 1000) {
+        lastClockUpdateMillis = currentMillis;
+        displayClock();
+      }
+
+      // ==== 新增：校准过程中刷新顶栏 ====
+      if (timeCalibrating) {
+        static unsigned long lastCalibDraw = 0;
+        if (currentMillis - lastCalibDraw >= 300) {
+          lastCalibDraw = currentMillis;
+          displayClock();  // 重绘顶栏进度条
+        }
+      }
+    }
+    return; // 时钟模式下不执行其他测量逻辑
+  }
+  
+  // 5. 健康站模式下特有逻辑
+  // 如果6秒内没有检测到手指，切换回时钟模式
+  static unsigned long lastFingerDetectedTime = 0;
+  if (fingerPlaced) {
+    lastFingerDetectedTime = currentMillis;
+  } else if (currentMillis - lastFingerDetectedTime > 6000) {
+    switchToClockMode();
+    return;
+  }
+  
+  // 处理校准模式（短按按钮触发）
+  if (calibrationMode) {
+    handleCalibration();
+    return; // 校准时不执行其他测量
+  }
+
+  // 更新状态提示
+  drawStatusText();
+  
+  // 更新健康模式下的时间显示（每分钟更新一次）
+  if (rtcAvailable && currentMillis - lastClockUpdateMillis >= 60000) {
+    lastClockUpdateMillis = currentMillis;
+    displayTimeInHealthMode();
+  }
+
+  // 健康数据测量和计算
+  if (fingerPlaced) {
+    // 心率检测逻辑
+    irWindow[winIndex] = irValue;
+    winIndex = (winIndex + 1) % windowSize;
+
+    if (winIndex == 0 && detectPeak(irWindow, windowSize)) {
+      unsigned long now = millis();
+      if (lastBeatTime > 0) {
+        unsigned long delta = now - lastBeatTime;
+        // 过滤不合理的心跳间隔（大约200 BPM 到 40 BPM）
+        if (delta >= 300 && delta <= 1500) { // 调整范围以适应更广的心率
+          float bpm = 60000.0 / delta;
+          if (bpm >= 40 && bpm <= 180) { // 再次过滤，确保在人体正常心率范围内
+            hrBuffer[hrBufferIndex] = bpm;
+            hrBufferIndex = (hrBufferIndex + 1) % bufferSize;
+          }
+        }
+      }
+      lastBeatTime = now;
+    }
+
+    // 血氧检测逻辑
+    // 确保有足够的样本再进行计算
+    if (bufferIndex < spo2BufferSize) {
+      irBuffer[bufferIndex] = irValue;
+      redBuffer[bufferIndex] = redValue;
+      bufferIndex++;
+    } else {
+      float irAC = 0, redAC = 0;
+      uint32_t irMin = 999999, irMax = 0;
+      uint32_t redMin = 999999, redMax = 0;
+
+      for (int i = 0; i < spo2BufferSize; i++) {
+        if (irBuffer[i] < irMin) irMin = irBuffer[i];
+        if (irBuffer[i] > irMax) irMax = irBuffer[i];
+        if (redBuffer[i] < redMin) redMin = redBuffer[i];
+        if (redBuffer[i] > redMax) redMax = redBuffer[i];
+      }
+
+      irAC = irMax - irMin;
+      redAC = redMax - redMin;
+      
+      // DC成分取最小值，也可以取平均值
+      float irDC = (float)irMin;
+      float redDC = (float)redMin;
+
+      // 确保分母不为零且值有效
+      if (irAC > 0 && redAC > 0 && irDC > 0 && redDC > 0) {
+        float R = (redAC / redDC) / (irAC / irDC);
+        // 使用常见的简化公式。注意：这可能不如MAX30105的官方算法准确，但对于演示足够
+        float spO2Temp = 110.0 - 25.0 * R; // 这是一个经验公式，可能需要根据实际传感器校准
+        
+        // 过滤血氧值到合理范围
+        if (spO2Temp > 100) spO2Temp = 100;
+        if (spO2Temp < 80) spO2Temp = 80; // 假设80%是最低的合理值
+
+        spO2Buffer[spO2BufferIndex] = spO2Temp;
+        spO2BufferIndex = (spO2BufferIndex + 1) % bufferSize;
+      } else {
+          Serial.println("Invalid AC/DC values for SpO2 calculation.");
+      }
+      bufferIndex = 0; // 重置缓冲，准备下一批数据
+    }
+  } else {
+    // 手指未放置时清空测量结果和缓冲
+    heartRate = 0;
+    spo2 = 0;
+    bufferIndex = 0;
+    winIndex = 0;
+    lastBeatTime = 0;
+    for (int i = 0; i < windowSize; i++) irWindow[i] = 0;
+    for (int i = 0; i < bufferSize; i++) { // 清空平均缓冲区
+      hrBuffer[i] = 0;
+      spO2Buffer[i] = 0;
+    }
+  }
+
+  // 每6秒更新一次主显示
+  if (currentMillis - lastUpdateMillis >= 6000) {
+    lastUpdateMillis = currentMillis;
+    float avgHeartRate = calculateAverage(hrBuffer, bufferSize);
+    float avgSpO2 = calculateAverage(spO2Buffer, bufferSize);
+    displayData(avgHeartRate, avgSpO2);
+  }
+
+  // 串口调试输出（降低频率以避免过载）
+  static unsigned long lastSerialPrint = 0;
+  if (currentMillis - lastSerialPrint >= 1000) { // 每秒打印一次
+    lastSerialPrint = currentMillis;
+    Serial.print("IR: "); Serial.print(irValue);
+    Serial.print(" | Red: "); Serial.print(redValue);
+    Serial.print(" | Threshold: "); Serial.print(personalThreshold);
+    Serial.print(" | Finger: "); Serial.print(fingerPlaced ? "YES" : "NO");
+    Serial.print(" | HR (Avg): "); Serial.print(calculateAverage(hrBuffer, bufferSize));
+    Serial.print(" | SpO2 (Avg): "); Serial.println(calculateAverage(spO2Buffer, bufferSize));
+  }
+}

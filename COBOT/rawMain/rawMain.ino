@@ -26,13 +26,6 @@ by watching BD spot movements: alternate high and low, left and right ]
 ********* algorithm = 6 *********
 [ example of combining movements ]
 */
-
-// 运动注释
-// high_left 表示左前腿 角度值为 0 时向前
-// high_right 表示右前腿 角度值为 0 时向后
-// low_left 表示左后腿 角度值为 0 时向前
-// low_right 表示右后腿 角度值为 0 时向后
-
 #include <Servo.h> // ************ INSTALL SERVO LIB ****************
 #include "Timer.h" // ************ INSTALL TIMER LIB ****************
 Timer timer;
@@ -47,10 +40,7 @@ const int trigPin = 4;
 const int echoPin = 5;
 long duration;
 int distance;
-int algorithm_selected = 0; // select algorithms
-int current_action = 1; // 当前动作索引 (1-6循环)
-bool was_close = false; // 上一次是否距离小于5cm
-const int TRIGGER_DISTANCE = 5; // 触发距离阈值 (cm)
+int algorithm_selected = 1; // select algorithms
 void setup() {
 Serial.begin(9600);
 low_left.attach(12);
@@ -74,48 +64,18 @@ Serial.println("done");
 Serial.println("Starting loop algorithm");
 }
 void loop() {
-// 读取距离
-readDistance();
-delay(50); // 短暂延迟，避免读取过快
-
-// 检测挥手动作：从小于5cm变为大于5cm
-bool is_close = (distance < TRIGGER_DISTANCE && distance > 0); // distance > 0 确保读数有效
-if (was_close && !is_close) {
-// 检测到挥手：从近到远
-Serial.print("检测到挥手！切换到动作: ");
-Serial.println(current_action);
-algorithm_selected = current_action;
-// 切换到下一个动作 (1-6循环)
-current_action++;
-if (current_action > 6) {
-current_action = 1;
-}
-// 如果是动作6，重置定时器
-if (algorithm_selected == 6) {
-timer.start();
-}
-}
-was_close = is_close;
-
-// 执行当前选定的动作
 if(algorithm_selected == 0) {
 resetAllServoPos();
-delay(100); // 避免循环过快
 } else if(algorithm_selected == 1) {
 alternateWalk();
-algorithm_selected = 0; // 动作完成后返回默认状态
 } else if(algorithm_selected == 2) {
 highAndLowSynchroWalk();
-algorithm_selected = 0; // 动作完成后返回默认状态
 } else if(algorithm_selected == 3) {
 littleJump();
-algorithm_selected = 0; // 动作完成后返回默认状态
 } else if(algorithm_selected == 4) {
 bow();
-algorithm_selected = 0; // 动作完成后返回默认状态
 } else if(algorithm_selected == 5) {
 hello();
-algorithm_selected = 0; // 动作完成后返回默认状态
 } else if(algorithm_selected == 6) {
 if(timer.read() < 3000) {
 hello();
@@ -123,7 +83,6 @@ hello();
 littleJump();
 } else {
 resetAllServoPos();
-algorithm_selected = 0; // 动作完成后返回默认状态
 }
 }
 }
@@ -139,13 +98,11 @@ Serial.print("Distance: ");
 Serial.println(distance);
 }
 void littleJump() {
-// 跳跃：所有腿都向前（准备跳起）
-low_right.write(180);  // 右后腿向前
-low_left.write(0);     // 左后腿向前
-high_right.write(180); // 右前腿向前
-high_left.write(0);    // 左前腿向前
+low_right.write(180);
+low_left.write(0);
+high_right.write(0);
+high_left.write(180);
 delay(1000);
-// 复位到标准位置
 low_right.write(90);
 low_left.write(90);
 high_right.write(90);
@@ -158,9 +115,8 @@ low_left.write(90);
 high_right.write(90);
 high_left.write(90);
 delay(1000);
-// 鞠躬：两个前腿都向前
-high_right.write(180); // 右前腿向前
-high_left.write(0);    // 左前腿向前
+high_right.write(0);
+high_left.write(180);
 delay(2000);
 high_right.write(90);
 high_left.write(90);
@@ -169,13 +125,11 @@ delay(4000);
 void hello() {
 low_right.write(90);
 low_left.write(90);
-high_right.write(90);
-// 挥手：左前腿从向后到向前
-high_left.write(180); // 左前腿向后（起始位置）
+high_right.write(110);
+high_left.write(0);
 delay(300);
-high_left.write(0);    // 左前腿向前（挥手）
+high_left.write(40);
 delay(300);
-high_left.write(90);  // 复位到中间位置
 }
 void alternateWalk() {
 for (pos = 0; pos <= 180; pos += 1) {
